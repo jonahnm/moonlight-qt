@@ -64,7 +64,14 @@ jobs:
           cmake -DSDL_KMSDRM=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_INSTALL_DOCS=OFF -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DCMAKE_INSTALL_PREFIX=${{ env.DEP_ROOT }} -S . -B build
           cmake --build build -j
           sudo cmake --install build
-
+      - name: Checkout sdl2-compat
+        uses: actions/checkout@v5
+        with:
+          repository: libsdl-org/sdl2-compat
+          ref: release-2.32.50  # Changed from 2.32.70
+          path: deps/sdl2-compat
+          submodules: 'recursive'
+  
       - name: Build sdl2-compat
         working-directory: deps/sdl2-compat
         run: |
@@ -72,20 +79,13 @@ jobs:
           cmake --build build -j
           sudo cmake --install build
           
-          # Create symlink so pkg-config can resolve 'sdl2'
+          # Create symlink so pkg-config can locate 'sdl2'
           if [ -f "${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2-compat.pc" ]; then
             ln -sf ${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2-compat.pc ${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2.pc
           fi
           if [ -f "/usr/local/lib/pkgconfig/sdl2-compat.pc" ]; then
             sudo ln -sf /usr/local/lib/pkgconfig/sdl2-compat.pc /usr/local/lib/pkgconfig/sdl2.pc
           fi
-
-      - name: Build sdl2-compat
-        working-directory: deps/sdl2-compat
-        run: |
-          cmake -DSDL2COMPAT_TESTS=OFF -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DCMAKE_INSTALL_PREFIX=${{ env.DEP_ROOT }} -DCMAKE_INSTALL_LIBDIR=lib -S . -B build
-          cmake --build build -j
-          sudo cmake --install build
 
       - name: Checkout SDL_ttf
         uses: actions/checkout@v5
