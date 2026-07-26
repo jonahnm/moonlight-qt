@@ -79,12 +79,12 @@ jobs:
           cmake --build build -j
           sudo cmake --install build
           
-          # Create symlink so pkg-config can locate 'sdl2'
+          # Force system-wide pkg-config availability for qmake
+          sudo mkdir -p /usr/share/pkgconfig
           if [ -f "${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2-compat.pc" ]; then
-            ln -sf ${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2-compat.pc ${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2.pc
-          fi
-          if [ -f "/usr/local/lib/pkgconfig/sdl2-compat.pc" ]; then
-            sudo ln -sf /usr/local/lib/pkgconfig/sdl2-compat.pc /usr/local/lib/pkgconfig/sdl2.pc
+            sudo cp ${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2-compat.pc /usr/share/pkgconfig/sdl2.pc
+          elif [ -f "/usr/local/lib/pkgconfig/sdl2-compat.pc" ]; then
+            sudo cp /usr/local/lib/pkgconfig/sdl2-compat.pc /usr/share/pkgconfig/sdl2.pc
           fi
 
       - name: Checkout SDL_ttf
@@ -194,8 +194,8 @@ jobs:
 
       - name: Build Binaries
         env:
-          EXTRA_QMAKE_FLAGS: CONFIG+=pyrowave PKG_CONFIG_PATH=${{ env.DEP_ROOT }}/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig
-          PKG_CONFIG_PATH: ${{ env.DEP_ROOT }}/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig
+          EXTRA_QMAKE_FLAGS: "CONFIG+=pyrowave PKG_CONFIG_PATH=${{ env.DEP_ROOT }}/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/share/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig"
+          PKG_CONFIG_PATH: "${{ env.DEP_ROOT }}/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/share/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig"
         run: |
           sudo ldconfig
           scripts/build-appimage.sh
