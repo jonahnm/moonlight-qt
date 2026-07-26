@@ -41,7 +41,7 @@ jobs:
             libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxkbcommon-dev \
             libxrandr-dev libxss-dev libxt-dev libxv-dev libxxf86vm-dev libxcb-dri3-dev \
             libx11-xcb-dev libxfixes-dev libxtst-dev wayland-protocols libopus-dev libvdpau-dev \
-            libgl-dev libpipewire-0.3-dev liburing-dev libvulkan-dev vulkan-tools cmake ninja-build
+            libgl-dev libpipewire-0.3-dev liburing-dev libvulkan-dev vulkan-tools cmake ninja-build pkg-config
           sudo pip3 install meson
           mkdir -p dep_root/{bin,include,lib}
           echo "DEP_ROOT=$PWD/dep_root" >> "${GITHUB_ENV}"
@@ -142,6 +142,8 @@ jobs:
 
       - name: Build FFmpeg
         working-directory: deps/FFmpeg
+        env:
+          PKG_CONFIG_PATH: ${{ env.DEP_ROOT }}/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig
         run: |
           ./configure --enable-pic --enable-lto --disable-static --enable-shared --disable-all --disable-autodetect \
             --enable-avcodec --enable-avformat --enable-swscale \
