@@ -46,6 +46,10 @@ jobs:
           mkdir -p dep_root/{bin,include,lib}
           echo "DEP_ROOT=$PWD/dep_root" >> "${GITHUB_ENV}"
           echo "$PWD/dep_root/bin" >> "${GITHUB_PATH}"
+          
+          # Force pkg-config to inspect all custom build locations
+          echo "PKG_CONFIG_PATH=$PWD/dep_root/lib/pkgconfig:$PWD/dep_root/share/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig" >> "${GITHUB_ENV}"
+          echo "LD_LIBRARY_PATH=$PWD/dep_root/lib:/usr/local/lib:/usr/lib/aarch64-linux-gnu" >> "${GITHUB_ENV}"
 
       - name: Checkout SDL3
         uses: actions/checkout@v5
@@ -57,7 +61,7 @@ jobs:
       - name: Build SDL3
         working-directory: deps/SDL
         run: |
-          cmake -DSDL_KMSDRM=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_INSTALL_DOCS=OFF -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -S . -B build
+          cmake -DSDL_KMSDRM=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_INSTALL_DOCS=OFF -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DCMAKE_INSTALL_PREFIX=${{ env.DEP_ROOT }} -S . -B build
           cmake --build build -j
           sudo cmake --install build
 
@@ -71,7 +75,7 @@ jobs:
       - name: Build sdl2-compat
         working-directory: deps/sdl2-compat
         run: |
-          cmake -DSDL2COMPAT_TESTS=OFF -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DCMAKE_INSTALL_LIBDIR=lib -S . -B build
+          cmake -DSDL2COMPAT_TESTS=OFF -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DCMAKE_INSTALL_PREFIX=${{ env.DEP_ROOT }} -DCMAKE_INSTALL_LIBDIR=lib -S . -B build
           cmake --build build -j
           sudo cmake --install build
 
