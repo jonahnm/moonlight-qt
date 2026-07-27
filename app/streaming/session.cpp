@@ -1671,6 +1671,11 @@ bool Session::startConnectionAsync()
     hostInfo.address = hostnameStr.data();
     hostInfo.serverInfoAppVersion = siAppVersion.data();
     hostInfo.serverCodecModeSupport = m_Computer->serverCodecModeSupport;
+#ifdef HAVE_PYROWAVE
+    if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE) {
+        hostInfo.serverCodecModeSupport |= SCM_PYROWAVE | SCM_PYROWAVE_444 | SCM_PYROWAVE10_420 | SCM_PYROWAVE10_444;
+    }
+#endif
 
     // Older GFE versions didn't have this field
     QByteArray siGfeVersion;
