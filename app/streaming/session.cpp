@@ -1074,6 +1074,24 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
     }
 
+#ifdef HAVE_PYROWAVE
+    if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) {
+        if (m_SupportedVideoFormats.maskByServerCodecModes(
+                m_Computer->serverCodecModeSupport &
+                (SCM_PYROWAVE | SCM_PYROWAVE_444 | SCM_PYROWAVE10_420 | SCM_PYROWAVE10_444)) == 0) {
+            if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE) {
+                emitLaunchWarning(tr("Your host software or GPU doesn't support encoding PyroWave."));
+            }
+            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_PYROWAVE);
+        }
+        else {
+            if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE) {
+                m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_PYROWAVE);
+            }
+        }
+    }
+#endif
+
     if (!(m_SupportedVideoFormats & ~VIDEO_FORMAT_MASK_H264) &&
             m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO &&
             getDecoderAvailability(testWindow,
@@ -1236,6 +1254,12 @@ bool Session::validateLaunch(SDL_Window* testWindow)
 
     // If we removed all codecs with the checks above, use H.264 as the codec of last resort.
     if (m_SupportedVideoFormats.empty()) {
+#ifdef HAVE_PYROWAVE
+        if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE) {
+            emit displayLaunchError(tr("This PC or host doesn't support the PyroWave codec."));
+            return false;
+        }
+#endif
         m_SupportedVideoFormats.append(VIDEO_FORMAT_H264);
     }
 
