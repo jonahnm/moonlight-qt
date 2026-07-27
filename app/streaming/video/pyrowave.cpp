@@ -63,21 +63,21 @@ PyroWaveVideoDecoder::PyroWaveVideoDecoder(bool testOnly)
       m_OverlayLock(0) {}
 
 PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
-    // Stop overlay updates before we tear down the libplacebo GPU that owns the overlay textures.
-    // Only the real (non-testOnly) decoder registers itself, and only while a Session is active
-    // (the testOnly probe runs during validateLaunch before Session::get() is set).
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor start testOnly=%d", m_TestOnly);
     if (!m_TestOnly && Session::get() != nullptr) {
         Session::get()->getOverlayManager().setOverlayRenderer(nullptr);
     }
 
     if (m_Decoder) {
-        pyrowave_decoder_destroy(m_Decoder);  // ensures PyroWave GPU is idle
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pyrowave_decoder_destroy");
+        pyrowave_decoder_destroy(m_Decoder);
     }
     if (m_SyncObj) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pyrowave_sync_object_destroy");
         pyrowave_sync_object_destroy(m_SyncObj);
     }
-    // libplacebo cleanup (also releases imported plane textures + their dmabuf fds).
     if (m_Vulkan) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pl_gpu_finish");
         pl_gpu_finish(m_Vulkan->gpu);
         for (auto& o : m_Overlays) {
             pl_tex_destroy(m_Vulkan->gpu, &o.overlay.tex);
@@ -90,39 +90,48 @@ PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
         }
     }
     if (m_PlSem && m_Vulkan) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor vkDestroySemaphore");
         vkDestroySemaphore(m_Vulkan->device, m_PlSem, nullptr);
     }
     if (m_Renderer) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pl_renderer_destroy");
         pl_renderer_destroy(&m_Renderer);
     }
     if (m_Swapchain) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pl_swapchain_destroy");
         pl_swapchain_destroy(&m_Swapchain);
     }
     if (m_Vulkan) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pl_vulkan_destroy");
         pl_vulkan_destroy(&m_Vulkan);
     }
     if (m_VkSurface && m_DestroySurface) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor vkDestroySurface");
         m_DestroySurface(m_PlVkInstance->instance, m_VkSurface, nullptr);
     }
     if (m_PlVkInstance) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pl_vk_inst_destroy");
         pl_vk_inst_destroy(&m_PlVkInstance);
     }
     if (m_Log) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pl_log_destroy");
         pl_log_destroy(&m_Log);
     }
-    // PyroWave device cleanup.
     if (m_VkDev) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor vkDeviceWaitIdle");
         vkDeviceWaitIdle(m_VkDev);
         for (auto& p : m_Planes) {
-            if (p.view) vkDestroyImageView(m_VkDev, p.view, nullptr);
-            if (p.image) vkDestroyImage(m_VkDev, p.image, nullptr);
-            if (p.mem) vkFreeMemory(m_VkDev, p.mem, nullptr);
+            if (p.view) { SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor destroying view %d", (int)(&p - m_Planes)); vkDestroyImageView(m_VkDev, p.view, nullptr); }
+            if (p.image) { SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor destroying image %d", (int)(&p - m_Planes)); vkDestroyImage(m_VkDev, p.image, nullptr); }
+            if (p.mem) { SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor freeing mem %d", (int)(&p - m_Planes)); vkFreeMemory(m_VkDev, p.mem, nullptr); }
         }
         if (m_VkPool) vkDestroyCommandPool(m_VkDev, m_VkPool, nullptr);
     }
     if (m_PyroDevice) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor pyrowave_device_destroy");
         pyrowave_device_destroy(m_PyroDevice);
     }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: ~dtor done");
 }
 
 bool PyroWaveVideoDecoder::createPyroDevice() {
@@ -294,26 +303,42 @@ bool PyroWaveVideoDecoder::createLibplacebo(PDECODER_PARAMETERS params) {
     m_Log = pl_log_create(PL_API_VER, &logParams);
 
     unsigned int extCount = 0;
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling SDL_Vulkan_GetInstanceExtensions (count)...");
     if (!SDL_Vulkan_GetInstanceExtensions(params->window, &extCount, nullptr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_GetInstanceExtensions(count) failed: %s", SDL_GetError());
         return false;
     }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_GetInstanceExtensions count=%u", extCount);
     std::vector<const char*> exts(extCount);
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling SDL_Vulkan_GetInstanceExtensions (list)...");
     if (!SDL_Vulkan_GetInstanceExtensions(params->window, &extCount, exts.data())) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_GetInstanceExtensions(list) failed: %s", SDL_GetError());
         return false;
     }
     pl_vk_inst_params ip = pl_vk_inst_default_params;
-    ip.get_proc_addr = (PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling SDL_Vulkan_GetVkGetInstanceProcAddr...");
+    PFN_vkGetInstanceProcAddr getProcAddr = (PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
+    if (!getProcAddr) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_GetVkGetInstanceProcAddr returned null");
+        return false;
+    }
+    ip.get_proc_addr = getProcAddr;
     ip.extensions = exts.data();
     ip.num_extensions = (int) exts.size();
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling pl_vk_inst_create...");
     m_PlVkInstance = pl_vk_inst_create(m_Log, &ip);
     if (!m_PlVkInstance) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pl_vk_inst_create failed");
         return false;
     }
     m_DestroySurface = (PFN_vkDestroySurfaceKHR) m_PlVkInstance->get_proc_addr(m_PlVkInstance->instance, "vkDestroySurfaceKHR");
 
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling SDL_Vulkan_CreateSurface...");
     if (!SDL_Vulkan_CreateSurface(params->window, m_PlVkInstance->instance, &m_VkSurface)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
         return false;
     }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_CreateSurface OK");
 
     pl_vulkan_params vp = pl_vulkan_default_params;
     vp.instance = m_PlVkInstance->instance;
@@ -332,8 +357,12 @@ bool PyroWaveVideoDecoder::createLibplacebo(PDECODER_PARAMETERS params) {
     if (!m_Swapchain) {
         return false;
     }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: m_Vulkan=%p m_Vulkan->gpu=%p", (void*)m_Vulkan, (void*)m_Vulkan->gpu);
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling pl_renderer_create...");
     m_Renderer = pl_renderer_create(m_Log, m_Vulkan->gpu);
-    return m_Renderer != nullptr;
+    bool ret = m_Renderer != nullptr;
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pl_renderer_create %s", ret ? "OK" : "FAILED");
+    return ret;
 }
 
 bool PyroWaveVideoDecoder::importPlanes() {
@@ -402,7 +431,11 @@ bool PyroWaveVideoDecoder::createSharedTimeline() {
 }
 
 bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: initialize() entered, fmt=0x%x %dx%d",
+                params->videoFormat, params->width, params->height);
+
     if (!(params->videoFormat & VIDEO_FORMAT_MASK_PYROWAVE)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: not a PyroWave format (0x%x)", params->videoFormat);
         return false;
     }
     m_YUV444 = !!(params->videoFormat & (VIDEO_FORMAT_PYROWAVE_444 | VIDEO_FORMAT_PYROWAVE10_444));
@@ -411,10 +444,12 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
     m_Height = params->height & ~1;
     m_Window = params->window;
 
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling createPyroDevice()...");
     if (!createPyroDevice()) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: device init failed");
         return false;
     }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createPyroDevice() OK");
 
     pyrowave_decoder_create_info ci{};
     ci.device = m_PyroDevice;
@@ -423,22 +458,45 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params) {
     ci.chroma = m_YUV444 ? PYROWAVE_CHROMA_SUBSAMPLING_444 : PYROWAVE_CHROMA_SUBSAMPLING_420;
     ci.fragment_path = pyrowave_decoder_device_prefers_fragment_path(m_PyroDevice);
     if (pyrowave_decoder_create(&ci, &m_Decoder) != PYROWAVE_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pyrowave_decoder_create failed");
         return false;
     }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pyrowave_decoder_create OK");
 
     if (m_TestOnly) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: testOnly, returning early");
         return true;
     }
 
-    // libplacebo first: plane images must be created with a DRM modifier libplacebo can import
-    // (createPlanes intersects the storage-capable modifiers with pl_fmt's import list — on some
-    // GPUs, e.g. Steam Deck's Van Gogh, radv otherwise picks a storage modifier pl can't sample).
-    if (!createLibplacebo(params) || !createPlanes() || !importPlanes() || !createSharedTimeline()) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: GPU present pipeline init failed");
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling createLibplacebo()...");
+    if (!createLibplacebo(params)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createLibplacebo failed");
         return false;
     }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createLibplacebo() OK");
+
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling createPlanes()...");
+    if (!createPlanes()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createPlanes failed");
+        return false;
+    }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createPlanes() OK");
+
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling importPlanes()...");
+    if (!importPlanes()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: importPlanes failed");
+        return false;
+    }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: importPlanes() OK");
+
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling createSharedTimeline()...");
+    if (!createSharedTimeline()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createSharedTimeline failed");
+        return false;
+    }
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createSharedTimeline() OK");
+
     m_TimelineReady = true;
-    // Composite the performance/status overlay on top of the video (same as the FFmpeg renderers).
     if (Session::get() != nullptr) {
         Session::get()->getOverlayManager().setOverlayRenderer(this);
     }
@@ -492,9 +550,11 @@ bool PyroWaveVideoDecoder::createOverlay(pl_overlay* overlay, SDL_Surface* surfa
 }
 
 void PyroWaveVideoDecoder::notifyOverlayUpdated(Overlay::OverlayType type) {
-    SDL_Surface* newSurface = Session::get()->getOverlayManager().getUpdatedOverlaySurface(type);
-    if (newSurface == nullptr && Session::get()->getOverlayManager().isOverlayEnabled(type)) {
-        return;  // enabled but no new surface: keep the existing texture
+    Session* session = Session::get();
+    if (!session) return;
+    SDL_Surface* newSurface = session->getOverlayManager().getUpdatedOverlaySurface(type);
+    if (newSurface == nullptr && session->getOverlayManager().isOverlayEnabled(type)) {
+        return;
     }
 
     SDL_AtomicLock(&m_OverlayLock);
@@ -615,6 +675,8 @@ void PyroWaveVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output,
 }
 
 int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: submitDecodeUnit entered, frame=%u", du->frameNumber);
+
     // Per-frame performance stats + overlay text (mirrors FFmpegVideoDecoder).
     if (!m_LastFrameNumber) {
         m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
@@ -630,14 +692,15 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
         m_ActiveWndVideoStats.renderedFrames = m_RenderedFrames.exchange(0);
         m_ActiveWndVideoStats.totalRenderTimeUs = m_TotalRenderTimeUs.exchange(0);
 
-        if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
+        Session* session = Session::get();
+        if (session && session->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
             VIDEO_STATS lastTwoWndStats = {};
             addVideoStats(m_LastWndVideoStats, lastTwoWndStats);
             addVideoStats(m_ActiveWndVideoStats, lastTwoWndStats);
             stringifyVideoStats(lastTwoWndStats,
-                                Session::get()->getOverlayManager().getOverlayText(Overlay::OverlayDebug),
-                                Session::get()->getOverlayManager().getOverlayMaxTextLength());
-            Session::get()->getOverlayManager().setOverlayTextUpdated(Overlay::OverlayDebug);
+                                session->getOverlayManager().getOverlayText(Overlay::OverlayDebug),
+                                session->getOverlayManager().getOverlayMaxTextLength());
+            session->getOverlayManager().setOverlayTextUpdated(Overlay::OverlayDebug);
         }
 
         SDL_memcpy(&m_LastWndVideoStats, &m_ActiveWndVideoStats, sizeof(m_ActiveWndVideoStats));
@@ -718,10 +781,13 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
     pyrowave_gpu_sync_operation release{};
     release.sync = {m_PwSem, sigVal};
     {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: calling pyrowave_decoder_decode_gpu_buffer...");
         std::lock_guard<std::mutex> lock(m_FrameLock);
         if (pyrowave_decoder_decode_gpu_buffer(m_Decoder, &acquire, &release, &gb) != PYROWAVE_SUCCESS) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pyrowave_decoder_decode_gpu_buffer failed");
             return DR_OK;
         }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pyrowave_decoder_decode_gpu_buffer OK");
         m_LastReleaseVal.store(sigVal);
         m_FrameReady = true;
     }
@@ -738,6 +804,7 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du) {
 }
 
 void PyroWaveVideoDecoder::renderFrameOnMainThread() {
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: renderFrameOnMainThread entered");
     uint64_t renderStartUs = LiGetMicroseconds();
     {
         std::lock_guard<std::mutex> lock(m_FrameLock);
@@ -820,8 +887,9 @@ void PyroWaveVideoDecoder::renderFrameOnMainThread() {
                     SDL_zero(m_Overlays[i].stagingOverlay);
                     m_Overlays[i].hasOverlay = true;
                 }
+                Session* session = Session::get();
                 if (m_Overlays[i].hasOverlay &&
-                    !Session::get()->getOverlayManager().isOverlayEnabled((Overlay::OverlayType) i)) {
+                    (!session || !session->getOverlayManager().isOverlayEnabled((Overlay::OverlayType) i))) {
                     overlayTexToDestroy.push_back(m_Overlays[i].overlay.tex);
                     SDL_zero(m_Overlays[i].overlay);
                     m_Overlays[i].hasOverlay = false;

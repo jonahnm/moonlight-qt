@@ -81,10 +81,10 @@ jobs:
           
           # Force system-wide pkg-config availability for qmake
           sudo mkdir -p /usr/share/pkgconfig
-          if [ -f "${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2-compat.pc" ]; then
-            sudo cp ${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2-compat.pc /usr/share/pkgconfig/sdl2.pc
-          elif [ -f "/usr/local/lib/pkgconfig/sdl2-compat.pc" ]; then
-            sudo cp /usr/local/lib/pkgconfig/sdl2-compat.pc /usr/share/pkgconfig/sdl2.pc
+          if [ -f "${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2_compat.pc" ]; then
+            sudo cp ${{ env.DEP_ROOT }}/lib/pkgconfig/sdl2_compat.pc /usr/share/pkgconfig/sdl2.pc
+          elif [ -f "/usr/local/lib/pkgconfig/sdl2_compat.pc" ]; then
+            sudo cp /usr/local/lib/pkgconfig/sdl2_compat.pc /usr/share/pkgconfig/sdl2.pc
           fi
 
       - name: Checkout SDL_ttf
