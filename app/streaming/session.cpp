@@ -973,7 +973,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
 
     if (ret) {
         // Video format is now locked in
-        m_StreamConfig.supportedVideoFormats = m_SupportedVideoFormats.front();
+        m_StreamConfig.supportedVideoFormats = m_SupportedVideoFormats;
 
         // Populate decoder-dependent properties.
         // Must be done after validateLaunch() since m_StreamConfig is finalized.
