@@ -67,10 +67,30 @@ if [ -e "$SOURCE_ROOT/pyrowave/build/libpyrowave-shared.so.0" ]; then
   EXTRA_DEPLOY_ARGS="--library=$SOURCE_ROOT/pyrowave/build/libpyrowave-shared.so.0"
 fi
 
+# Locate libSDL3.so.0 — installed to DEP_ROOT with SDL3 cmake build,
+# so it may not be in /usr/local/lib. Use pkg-config if available.
+SDL3_LIBRARY=""
+if [ -n "$SDL3_LIBRARY_PATH" ]; then
+  SDL3_LIBRARY="$SDL3_LIBRARY_PATH"
+elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists sdl3 2>/dev/null; then
+  SDL3_LIBDIR=$(pkg-config --variable=libdir sdl3 2>/dev/null)
+  if [ -n "$SDL3_LIBDIR" ] && [ -f "$SDL3_LIBDIR/libSDL3.so.0" ]; then
+    SDL3_LIBRARY="$SDL3_LIBDIR/libSDL3.so.0"
+  fi
+fi
+# Check dep_root relative to source root (CI builds install SDL3 here)
+if [ -z "$SDL3_LIBRARY" ] && [ -f "$SOURCE_ROOT/dep_root/lib/libSDL3.so.0" ]; then
+  SDL3_LIBRARY="$SOURCE_ROOT/dep_root/lib/libSDL3.so.0"
+fi
+if [ -z "$SDL3_LIBRARY" ]; then
+  SDL3_LIBRARY="/usr/local/lib/libSDL3.so.0"
+fi
+echo "SDL3 library: $SDL3_LIBRARY"
+
 echo Creating AppImage
 pushd $INSTALLER_FOLDER
 VERSION=$VERSION $LINUXDEPLOY --appdir $DEPLOY_FOLDER \
-  --library=/usr/local/lib/libSDL3.so.0 \
+  --library="$SDL3_LIBRARY" \
   $EXTRA_DEPLOY_ARGS \
   --plugin qt --output appimage || fail "linuxdeploy failed!"
 popd
