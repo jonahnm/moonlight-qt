@@ -32,13 +32,6 @@ jobs:
       - name: Setup environment
         run: |
           sudo apt-get update
-
-          # libshaderc is not in standard Ubuntu 22.04 repos, so add LunarG Vulkan SDK repo
-          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list 2>/dev/null || \
-            sudo sh -c 'echo "deb https://packages.lunarg.com/vulkan jammy main" > /etc/apt/sources.list.d/lunarg-vulkan-jammy.list'
-          sudo apt-get update
-
           sudo apt-get install -y \
             qt6-base-dev qt6-declarative-dev libqt6svg6-dev qml6-module-qtquick-controls \
             qml6-module-qtquick-templates qml6-module-qtquick-layouts qml6-module-qtqml-workerscript \
@@ -48,7 +41,7 @@ jobs:
             libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxkbcommon-dev \
             libxrandr-dev libxss-dev libxt-dev libxv-dev libxxf86vm-dev libxcb-dri3-dev \
             libx11-xcb-dev libxfixes-dev libxtst-dev wayland-protocols libopus-dev libvdpau-dev \
-            libgl-dev libpipewire-0.3-dev liburing-dev libvulkan-dev vulkan-tools cmake ninja-build pkg-config libshaderc-dev
+            libgl-dev libpipewire-0.3-dev liburing-dev libvulkan-dev vulkan-tools cmake ninja-build pkg-config libglslang-dev glslang-tools
           sudo pip3 install meson
           mkdir -p dep_root/{bin,include,lib}
           echo "DEP_ROOT=$PWD/dep_root" >> "${GITHUB_ENV}"
@@ -147,7 +140,7 @@ jobs:
       - name: Build libplacebo
         working-directory: deps/libplacebo
         run: |
-          meson setup build -Dvulkan=enabled -Dshaderc=enabled -Dglslang=disabled -Dopengl=disabled -Ddemos=false
+          meson setup build -Dvulkan=enabled -Dglslang=enabled -Dopengl=disabled -Ddemos=false
           ninja -C build
           sudo ninja install -C build
 
