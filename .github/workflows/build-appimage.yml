@@ -41,15 +41,36 @@ jobs:
             libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxkbcommon-dev \
             libxrandr-dev libxss-dev libxt-dev libxv-dev libxxf86vm-dev libxcb-dri3-dev \
             libx11-xcb-dev libxfixes-dev libxtst-dev wayland-protocols libopus-dev libvdpau-dev \
-            libgl-dev libpipewire-0.3-dev liburing-dev libvulkan-dev vulkan-tools cmake ninja-build pkg-config libglslang-dev glslang-tools
+            libgl-dev libpipewire-0.3-dev liburing-dev libvulkan-dev vulkan-tools cmake ninja-build pkg-config
           sudo pip3 install meson
+
+      - name: Build shaderc from source
+        run: |
+          # libshaderc is not packageable in Ubuntu 22.04 arm64 repos, so we build it
+          # from the official Google repository. This also builds glslang and SPIRV-Tools
+          # from submodules.
+          git clone --depth 1 --branch v2026.3 https://github.com/google/shaderc.git /tmp/shaderc
+          cd /tmp/shaderc
+          ./utils/git-sync-deps
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_EXECUTABLES=ON \
+            -DSHADERC_ENABLE_WERROR_COMPILE=OFF \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          ninja -C build
+          sudo ninja -C build install
+          rm -rf /tmp/shaderc
+
           mkdir -p dep_root/{bin,include,lib}
           echo "DEP_ROOT=$PWD/dep_root" >> "${GITHUB_ENV}"
           echo "$PWD/dep_root/bin" >> "${GITHUB_PATH}"
-          
+
           # Force pkg-config to inspect all custom build locations
           echo "PKG_CONFIG_PATH=$PWD/dep_root/lib/pkgconfig:$PWD/dep_root/share/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig" >> "${GITHUB_ENV}"
           echo "LD_LIBRARY_PATH=$PWD/dep_root/lib:/usr/local/lib:/usr/lib/aarch64-linux-gnu" >> "${GITHUB_ENV}"
+          ldconfig /usr/local/lib 2>/dev/null || true
 
       - name: Checkout SDL3
         uses: actions/checkout@v5
@@ -140,7 +161,7 @@ jobs:
       - name: Build libplacebo
         working-directory: deps/libplacebo
         run: |
-          meson setup build -Dvulkan=enabled -Dglslang=enabled -Dopengl=disabled -Ddemos=false
+          meson setup build -Dvulkan=enabled -Dshaderc=enabled -Dopengl=disabled -Ddemos=false
           ninja -C build
           sudo ninja install -C build
 
