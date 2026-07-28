@@ -41,7 +41,7 @@ jobs:
             libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxkbcommon-dev \
             libxrandr-dev libxss-dev libxt-dev libxv-dev libxxf86vm-dev libxcb-dri3-dev \
             libx11-xcb-dev libxfixes-dev libxtst-dev wayland-protocols libopus-dev libvdpau-dev \
-            libgl-dev libpipewire-0.3-dev liburing-dev libvulkan-dev vulkan-tools cmake ninja-build pkg-config libshaderc-dev
+            libgl-dev libpipewire-0.3-dev liburing-dev libvulkan-dev vulkan-tools cmake ninja-build pkg-config shaderc
           sudo pip3 install meson
           mkdir -p dep_root/{bin,include,lib}
           echo "DEP_ROOT=$PWD/dep_root" >> "${GITHUB_ENV}"
@@ -140,7 +140,7 @@ jobs:
       - name: Build libplacebo
         working-directory: deps/libplacebo
         run: |
-          meson setup build -Dvulkan=enabled -Dshaderc=enabled -Dopengl=disabled -Ddemos=false
+          meson setup build -Dvulkan=enabled -Dshaderc=enabled -Dglslang=disabled -Dopengl=disabled -Ddemos=false
           ninja -C build
           sudo ninja install -C build
 
