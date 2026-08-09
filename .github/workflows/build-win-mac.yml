@@ -4,6 +4,13 @@ permissions:
   contents: read
 
 on:
+  workflow_dispatch:
+    inputs:
+      ci_version:
+        description: 'CI Version tag or build number'
+        required: true
+        default: 'dev'
+        type: string
   workflow_call:
     inputs:
       ci_version:
