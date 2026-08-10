@@ -1,0 +1,29 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 775821a..2b9d20a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -129,6 +129,11 @@ if (${PROJECT_IS_TOP_LEVEL})
+             SOVERSION ${PYROWAVE_API_VERSION_MAJOR}
+             DLL_NAME_WITH_SOVERSION ON)
+ 
++    if (APPLE)
++        # Use an @rpath install name so the dylib can be relocated into the app bundle.
++        set_target_properties(pyrowave-shared PROPERTIES MACOSX_RPATH ON INSTALL_NAME_DIR "@rpath")
++    endif()
++
+     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/pyrowave.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pyrowave)
+     install(TARGETS pyrowave-shared EXPORT pyrowave-sharedConfig
+             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+@@ -156,6 +161,12 @@ if (${PROJECT_IS_TOP_LEVEL})
+         target_sources(pyrowave-shared PRIVATE pyrowave-shared.def)
+         set_target_properties(pyrowave-shared PROPERTIES PREFIX "lib")
+         target_link_libraries(pyrowave-c-interop-test PRIVATE d3d11 d3d12 dxgi)
++    elseif (APPLE)
++        # ld64 does not support --version-script; export the pyrowave_* C API via
++        # -exported_symbols_list instead (equivalent to link.T).
++        set(PYROWAVE_EXPORTED_SYMBOLS ${CMAKE_CURRENT_BINARY_DIR}/pyrowave-exported-symbols.txt)
++        file(WRITE ${PYROWAVE_EXPORTED_SYMBOLS} "_pyrowave_*\n")
++        target_link_options(pyrowave-shared PRIVATE -Wl,-exported_symbols_list,${PYROWAVE_EXPORTED_SYMBOLS})
+     else()
+         target_link_options(pyrowave-shared PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/link.T)
+     endif()

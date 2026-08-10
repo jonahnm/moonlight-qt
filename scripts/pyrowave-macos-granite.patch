@@ -1,0 +1,20 @@
+diff --git a/util/timer.cpp b/util/timer.cpp
+index a1408352..60a4d20e 100644
+--- a/util/timer.cpp
++++ b/util/timer.cpp
+@@ -145,8 +145,15 @@ void sleep_until_nsecs(int64_t timepoint)
+ 	ts.tv_nsec = timepoint % 1000000000ll;
+ 	// Linux does not support clock_nanosleep with MONOTONIC_RAW :(
+ 	int ret;
++#ifdef __APPLE__
++	// macOS does not expose TIMER_ABSTIME for clock_nanosleep(); the absolute
++	// deadline is approximated with a relative sleep (timer.cpp is only used
++	// for internal scheduling, not PyroWave decode timing).
++	nanosleep(&ts, nullptr);
++#else
+ 	while ((ret = clock_nanosleep(timebase, TIMER_ABSTIME, &ts, nullptr)) == EINTR) {}
+ #endif
++#endif
+ }
+ 
+ void Timer::start()
