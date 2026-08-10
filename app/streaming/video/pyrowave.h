@@ -88,6 +88,7 @@ private:
     // planes are plain storable libplacebo textures and the timeline semaphore is shared by
     // direct handle (m_PwSem == m_PlSem).
     bool createAppleVulkan();    // instance + surface + device + libplacebo import/swapchain/renderer
+    bool createAppleSurface();   // SDL surface + libplacebo swapchain/renderer (real streams only)
     bool createApplePyroDevice();// pyrowave_create_device() sharing the handles above
     bool createApplePlanes();    // storable/sampleable pl_tex planes
 #endif

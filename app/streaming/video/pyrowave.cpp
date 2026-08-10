@@ -282,25 +282,21 @@ bool PyroWaveVideoDecoder::createAppleVulkan() {
     auto vkEnumeratePhysicalDevices = loadAppleVkProc<PFN_vkEnumeratePhysicalDevices>(m_AppleGetProcAddr, m_VkInstance, "vkEnumeratePhysicalDevices");
     auto vkGetPhysicalDeviceProperties = loadAppleVkProc<PFN_vkGetPhysicalDeviceProperties>(m_AppleGetProcAddr, m_VkInstance, "vkGetPhysicalDeviceProperties");
     auto vkGetPhysicalDeviceQueueFamilyProperties = loadAppleVkProc<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(m_AppleGetProcAddr, m_VkInstance, "vkGetPhysicalDeviceQueueFamilyProperties");
-    auto vkGetPhysicalDeviceSurfaceSupportKHR = loadAppleVkProc<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(m_AppleGetProcAddr, m_VkInstance, "vkGetPhysicalDeviceSurfaceSupportKHR");
     auto vkGetPhysicalDeviceFeatures2 = loadAppleVkProc<PFN_vkGetPhysicalDeviceFeatures2>(m_AppleGetProcAddr, m_VkInstance, "vkGetPhysicalDeviceFeatures2");
     auto vkEnumerateDeviceExtensionProperties = loadAppleVkProc<PFN_vkEnumerateDeviceExtensionProperties>(m_AppleGetProcAddr, m_VkInstance, "vkEnumerateDeviceExtensionProperties");
     auto vkCreateDevice = loadAppleVkProc<PFN_vkCreateDevice>(m_AppleGetProcAddr, m_VkInstance, "vkCreateDevice");
     if (!vkEnumeratePhysicalDevices || !vkGetPhysicalDeviceProperties || !vkGetPhysicalDeviceQueueFamilyProperties ||
-        !vkGetPhysicalDeviceSurfaceSupportKHR || !vkGetPhysicalDeviceFeatures2 ||
-        !vkEnumerateDeviceExtensionProperties || !vkCreateDevice) {
+        !vkGetPhysicalDeviceFeatures2 || !vkEnumerateDeviceExtensionProperties || !vkCreateDevice) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: missing instance-level Vulkan functions from MoltenVK");
         return false;
     }
 
     m_DestroySurface = (PFN_vkDestroySurfaceKHR) m_AppleGetProcAddr(m_VkInstance, "vkDestroySurfaceKHR");
-    if (!SDL_Vulkan_CreateSurface(m_Window, m_VkInstance, &m_VkSurface)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
-        return false;
-    }
 
     // Pick the first present-capable GPU with a graphics+compute queue family (MoltenVK exposes a
-    // single family that covers everything).
+    // single family that covers everything). The surface is only created in createAppleSurface(),
+    // which runs for real streams (never for testOnly availability probes), so present support
+    // cannot be checked here; MoltenVK's single queue family always presents.
     uint32_t gpuCount = 0;
     if (vkEnumeratePhysicalDevices(m_VkInstance, &gpuCount, nullptr) != VK_SUCCESS || gpuCount == 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: no Vulkan physical devices");
@@ -325,10 +321,8 @@ bool PyroWaveVideoDecoder::createAppleVulkan() {
                 (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
                 continue;
             }
-            VkBool32 present = VK_FALSE;
-            if (vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, m_VkSurface, &present) != VK_SUCCESS || !present) {
-                continue;
-            }
+            // NB: The surface is created later (createAppleSurface(), real streams only), so
+            // present support is not checked here. MoltenVK's single queue family presents.
             m_VkPhys = gpu;
             m_AppleQueueFamily = i;
             break;
@@ -477,6 +471,17 @@ bool PyroWaveVideoDecoder::createAppleVulkan() {
     m_Vulkan = pl_vulkan_import(m_Log, &ip);
     if (!m_Vulkan) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pl_vulkan_import failed");
+        return false;
+    }
+    return true;
+}
+
+bool PyroWaveVideoDecoder::createAppleSurface() {
+    // Real-stream only (never called for testOnly availability probes): the SDL window surface,
+    // libplacebo swapchain and renderer. Kept separate from createAppleVulkan() so the test
+    // probes stay headless, like the Linux build (which also skips its present path for probes).
+    if (!SDL_Vulkan_CreateSurface(m_Window, m_VkInstance, &m_VkSurface)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
         return false;
     }
 
@@ -746,10 +751,16 @@ bool PyroWaveVideoDecoder::createPlanes() {
 
 bool PyroWaveVideoDecoder::createLibplacebo(PDECODER_PARAMETERS params) {
 #if defined(__APPLE__)
-    // On macOS the libplacebo instance/device/swapchain were created in createAppleVulkan() so
-    // PyroWave could share the same MoltenVK device (see createPyroDevice()).
-    PWL("createLibplacebo() already done via shared MoltenVK device");
-    return m_Vulkan != nullptr && m_Swapchain != nullptr && m_Renderer != nullptr;
+    // The libplacebo instance/device were created in createAppleVulkan() so PyroWave could share
+    // the same MoltenVK device (see createPyroDevice()). The window surface, swapchain and
+    // renderer are created here, for real streams only (testOnly probes return before this).
+    PWL("calling createAppleSurface()...");
+    if (!createAppleSurface()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createAppleSurface failed");
+        return false;
+    }
+    PWL("createAppleSurface() OK");
+    return true;
 #else
     pl_log_params logParams = pl_log_default_params;
     logParams.log_cb = [](void*, pl_log_level lvl, const char* msg) {
