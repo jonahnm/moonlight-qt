@@ -60,6 +60,24 @@ jobs:
           version: ${{ matrix.qt_version }}
           aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@073e34d7c2ab4ae6961ed7cca690b3abd5ba5a7e'
 
+      - name: Build PyroWave (macOS)
+        if: runner.os == 'macOS'
+        working-directory: pyrowave
+        run: |
+          ./checkout_granite.sh
+          git apply ../scripts/pyrowave-macos.patch
+          git -C Granite apply ../../scripts/pyrowave-macos-granite.patch
+          # The app is built as a universal binary (x86_64 + arm64), so the dylib must be too.
+          # The deployment target matches the app (macOS 13) so the dylib loads on old macOS.
+          cmake -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+          cmake --build build-arm64 -j
+          cmake -B build-x86_64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+          cmake --build build-x86_64 -j
+          mkdir -p build
+          lipo -create build-arm64/libpyrowave-shared.0.dylib build-x86_64/libpyrowave-shared.0.dylib \
+            -output build/libpyrowave-shared.0.dylib
+          ln -sf libpyrowave-shared.0.dylib build/libpyrowave-shared.dylib
+
       - name: Install Qt ARM64 (Windows)
         if: runner.os == 'Windows'
         uses: jurplel/install-qt-action@v4
@@ -97,6 +115,8 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: scripts/generate-dmg.sh Release
+        env:
+          EXTRA_QMAKE_FLAGS: "CONFIG+=pyrowave"
 
       - name: Verify DMG exists (macOS)
         if: runner.os == 'macOS'

@@ -13,7 +13,9 @@
 
   #include "streaming/session.h"
 
+#if !defined(__APPLE__)
   #include <drm_fourcc.h>
+#endif
 
 #include <cstring>
 #include <cstdio>
@@ -24,6 +26,7 @@
 #define PWL(...) do { fprintf(stderr, "PyroWave: " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } while(0)
 
 namespace {
+#if !defined(__APPLE__)
   uint32_t findMemoryType(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
@@ -52,6 +55,14 @@ namespace {
     }
     return out;
   }
+#endif  // !__APPLE__
+
+#if defined(__APPLE__)
+  template <typename T>
+  T loadAppleVkProc(PFN_vkGetInstanceProcAddr addr, VkInstance instance, const char* name) {
+    return reinterpret_cast<T>(addr(instance, name));
+  }
+#endif  // __APPLE__
 }  // namespace
 
 PyroWaveVideoDecoder::PyroWaveVideoDecoder(bool testOnly)
@@ -65,7 +76,15 @@ PyroWaveVideoDecoder::PyroWaveVideoDecoder(bool testOnly)
       m_PlSem(VK_NULL_HANDLE), m_SyncObj(nullptr), m_PwSem(VK_NULL_HANDLE),
       m_TlNext(0), m_LastHoldVal(0), m_LastReleaseVal(0), m_TimelineReady(false),
       m_FrameReady(false), m_LastFrameNumber(0), m_RenderedFrames(0), m_TotalRenderTimeUs(0),
-      m_OverlayLock(0) {}
+      m_OverlayLock(0)
+#if defined(__APPLE__)
+      , m_VkInstance(VK_NULL_HANDLE), m_AppleAppInfo{}, m_AppleInstCreateInfo{},
+      m_AppleQueueCreateInfo{}, m_AppleDevCreateInfo{}, m_AppleDevFeatures{},
+      m_AppleDevVk11Features{}, m_AppleDevVk12Features{}, m_AppleDevVk13Features{},
+      m_AppleDevFloat16Int8Features{}, m_AppleGetProcAddr(nullptr),
+      m_AppleQueuePriority(1.0f), m_AppleQueueFamily(UINT32_MAX)
+#endif
+      {}  // NOLINT (empty body is intentional)
 
 PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
     PWL("~dtor start testOnly=%d", m_TestOnly);
@@ -110,6 +129,12 @@ PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
         PWL("~dtor pl_vulkan_destroy");
         pl_vulkan_destroy(&m_Vulkan);
     }
+#if defined(__APPLE__)
+    if (m_VkSurface && m_DestroySurface) {
+        PWL("~dtor vkDestroySurface");
+        m_DestroySurface(m_VkInstance, m_VkSurface, nullptr);
+    }
+#else
     if (m_VkSurface && m_DestroySurface) {
         PWL("~dtor vkDestroySurface");
         m_DestroySurface(m_PlVkInstance->instance, m_VkSurface, nullptr);
@@ -118,6 +143,7 @@ PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
         PWL("~dtor pl_vk_inst_destroy");
         pl_vk_inst_destroy(&m_PlVkInstance);
     }
+#endif
     if (m_Log) {
         PWL("~dtor pl_log_destroy");
         pl_log_destroy(&m_Log);
@@ -125,21 +151,430 @@ PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
     if (m_VkDev) {
         PWL("~dtor vkDeviceWaitIdle");
         vkDeviceWaitIdle(m_VkDev);
+#if !defined(__APPLE__)
+        // On macOS the planes are libplacebo-owned pl_tex (destroyed above); the PyroWave device
+        // shares our VkDevice, so nothing here belongs to this decoder.
         for (auto& p : m_Planes) {
             if (p.view) { PWL("~dtor destroying view %d", (int)(&p - m_Planes)); vkDestroyImageView(m_VkDev, p.view, nullptr); }
             if (p.image) { PWL("~dtor destroying image %d", (int)(&p - m_Planes)); vkDestroyImage(m_VkDev, p.image, nullptr); }
             if (p.mem) { PWL("~dtor freeing mem %d", (int)(&p - m_Planes)); vkFreeMemory(m_VkDev, p.mem, nullptr); }
         }
         if (m_VkPool) vkDestroyCommandPool(m_VkDev, m_VkPool, nullptr);
+#endif
     }
     if (m_PyroDevice) {
         PWL("~dtor pyrowave_device_destroy");
         pyrowave_device_destroy(m_PyroDevice);
     }
+#if defined(__APPLE__)
+    // We created the instance/device for both libplacebo and PyroWave, so we own their teardown.
+    if (m_VkDev) {
+        PWL("~dtor vkDestroyDevice");
+        vkDestroyDevice(m_VkDev, nullptr);
+    }
+    if (m_VkInstance) {
+        PWL("~dtor vkDestroyInstance");
+        vkDestroyInstance(m_VkInstance, nullptr);
+    }
+#endif
     PWL("~dtor done");
 }
 
+#if defined(__APPLE__)
+bool PyroWaveVideoDecoder::createAppleVulkan() {
+    // On macOS Vulkan is MoltenVK. There is no Vulkan loader; the app links libMoltenVK directly,
+    // so SDL finds it (dlopen "libMoltenVK.dylib") and its vkGetInstanceProcAddr serves as the
+    // entry point for everything below. The instance, surface and device are created here so
+    // libplacebo (pl_vulkan_import) and PyroWave (pyrowave_create_device) share one device.
+
+    pl_log_params logParams = pl_log_default_params;
+    logParams.log_cb = [](void*, pl_log_level lvl, const char* msg) {
+        if (lvl <= PL_LOG_WARN) SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "[pl] %s", msg);
+    };
+    logParams.log_level = PL_LOG_INFO;
+    m_Log = pl_log_create(PL_API_VER, &logParams);
+    if (!m_Log) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pl_log_create failed");
+        return false;
+    }
+
+    // Get MoltenVK's vkGetInstanceProcAddr via SDL. Prefer an explicit load so bundled
+    // (Contents/Frameworks) and dev-build (rpath) layouts both work.
+    PWL("apple: SDL_Vulkan_GetVkGetInstanceProcAddr...");
+    m_AppleGetProcAddr = (PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
+    PWL("apple: initial proc addr %p", (void*) m_AppleGetProcAddr);
+    if (!m_AppleGetProcAddr) {
+        const char* basePath = SDL_GetBasePath();
+        std::string candidates[] = {
+            std::string(basePath ? basePath : "") + "../Frameworks/libMoltenVK.dylib",
+            std::string(basePath ? basePath : "") + "../Frameworks/libvulkan.dylib",
+            "@rpath/libMoltenVK.dylib",
+            "libMoltenVK.dylib",
+        };
+        for (auto& candidate : candidates) {
+            PWL("apple: trying SDL_Vulkan_LoadLibrary(\"%s\")", candidate.c_str());
+            if (SDL_Vulkan_LoadLibrary(candidate.c_str())) {
+                m_AppleGetProcAddr = (PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
+                if (m_AppleGetProcAddr) {
+                    PWL("apple: loaded via \"%s\"", candidate.c_str());
+                    break;
+                }
+            }
+        }
+    }
+    if (!m_AppleGetProcAddr) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: no Vulkan entry point (is libMoltenVK.dylib loadable?)");
+        return false;
+    }
+
+    unsigned int extCount = 0;
+    PWL("apple: SDL_Vulkan_GetInstanceExtensions(count)...");
+    if (!SDL_Vulkan_GetInstanceExtensions(m_Window, &extCount, nullptr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_GetInstanceExtensions(count) failed: %s", SDL_GetError());
+        return false;
+    }
+    PWL("apple: count=%u", extCount);
+    std::vector<const char*> sdlExts(extCount);
+    if (!SDL_Vulkan_GetInstanceExtensions(m_Window, &extCount, sdlExts.data())) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_GetInstanceExtensions(list) failed: %s", SDL_GetError());
+        return false;
+    }
+    PWL("apple: extensions fetched");
+
+    // SDL's WSI extensions (VK_KHR_surface + VK_EXT_metal_surface). MoltenVK is loaded directly
+    // (no loader), so VK_KHR_portability_enumeration is neither needed nor supported by it.
+    m_AppleInstanceExtensions.clear();
+    m_AppleInstanceExtensions.insert(m_AppleInstanceExtensions.end(), sdlExts.begin(), sdlExts.end());
+
+    m_AppleAppInfo = {};
+    m_AppleAppInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    m_AppleAppInfo.pApplicationName = "Moonlight";
+    m_AppleAppInfo.applicationVersion = 1;
+    m_AppleAppInfo.pEngineName = "Moonlight";
+    m_AppleAppInfo.engineVersion = 1;
+    // Vulkan 1.3 gives us subgroup size control (PyroWave) and core timeline semaphores
+    // (libplacebo), both of which MoltenVK 1.4.x supports.
+    m_AppleAppInfo.apiVersion = VK_API_VERSION_1_3;
+
+    VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ci.pApplicationInfo = &m_AppleAppInfo;
+    ci.enabledExtensionCount = (uint32_t) m_AppleInstanceExtensions.size();
+    ci.ppEnabledExtensionNames = m_AppleInstanceExtensions.data();
+
+    // vkGetInstanceProcAddr(NULL, ...) only resolves *global* commands (vkCreateInstance etc.);
+    // instance-level commands need a valid VkInstance and device-level commands a VkDevice, so
+    // those are resolved below at the right time.
+    auto vkCreateInstance = loadAppleVkProc<PFN_vkCreateInstance>(m_AppleGetProcAddr, nullptr, "vkCreateInstance");
+    if (!vkCreateInstance) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: vkCreateInstance not available from MoltenVK");
+        return false;
+    }
+
+    VkResult result = vkCreateInstance(&ci, nullptr, &m_VkInstance);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: vkCreateInstance failed (%d)", (int) result);
+        return false;
+    }
+    // Remember the exact create info: PyroWave requires it to stay valid for the device lifetime.
+    m_AppleInstCreateInfo = ci;
+
+    auto vkEnumeratePhysicalDevices = loadAppleVkProc<PFN_vkEnumeratePhysicalDevices>(m_AppleGetProcAddr, m_VkInstance, "vkEnumeratePhysicalDevices");
+    auto vkGetPhysicalDeviceProperties = loadAppleVkProc<PFN_vkGetPhysicalDeviceProperties>(m_AppleGetProcAddr, m_VkInstance, "vkGetPhysicalDeviceProperties");
+    auto vkGetPhysicalDeviceQueueFamilyProperties = loadAppleVkProc<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(m_AppleGetProcAddr, m_VkInstance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    auto vkGetPhysicalDeviceSurfaceSupportKHR = loadAppleVkProc<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(m_AppleGetProcAddr, m_VkInstance, "vkGetPhysicalDeviceSurfaceSupportKHR");
+    auto vkGetPhysicalDeviceFeatures2 = loadAppleVkProc<PFN_vkGetPhysicalDeviceFeatures2>(m_AppleGetProcAddr, m_VkInstance, "vkGetPhysicalDeviceFeatures2");
+    auto vkEnumerateDeviceExtensionProperties = loadAppleVkProc<PFN_vkEnumerateDeviceExtensionProperties>(m_AppleGetProcAddr, m_VkInstance, "vkEnumerateDeviceExtensionProperties");
+    auto vkCreateDevice = loadAppleVkProc<PFN_vkCreateDevice>(m_AppleGetProcAddr, m_VkInstance, "vkCreateDevice");
+    if (!vkEnumeratePhysicalDevices || !vkGetPhysicalDeviceProperties || !vkGetPhysicalDeviceQueueFamilyProperties ||
+        !vkGetPhysicalDeviceSurfaceSupportKHR || !vkGetPhysicalDeviceFeatures2 ||
+        !vkEnumerateDeviceExtensionProperties || !vkCreateDevice) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: missing instance-level Vulkan functions from MoltenVK");
+        return false;
+    }
+
+    m_DestroySurface = (PFN_vkDestroySurfaceKHR) m_AppleGetProcAddr(m_VkInstance, "vkDestroySurfaceKHR");
+    if (!SDL_Vulkan_CreateSurface(m_Window, m_VkInstance, &m_VkSurface)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+        return false;
+    }
+
+    // Pick the first present-capable GPU with a graphics+compute queue family (MoltenVK exposes a
+    // single family that covers everything).
+    uint32_t gpuCount = 0;
+    if (vkEnumeratePhysicalDevices(m_VkInstance, &gpuCount, nullptr) != VK_SUCCESS || gpuCount == 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: no Vulkan physical devices");
+        return false;
+    }
+    std::vector<VkPhysicalDevice> gpus(gpuCount);
+    vkEnumeratePhysicalDevices(m_VkInstance, &gpuCount, gpus.data());
+    m_VkPhys = VK_NULL_HANDLE;
+    m_AppleQueueFamily = UINT32_MAX;
+    for (auto gpu : gpus) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(gpu, &props);
+        if (props.apiVersion < VK_API_VERSION_1_2) {
+            continue;
+        }
+        uint32_t qn = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(gpu, &qn, nullptr);
+        std::vector<VkQueueFamilyProperties> qf(qn);
+        vkGetPhysicalDeviceQueueFamilyProperties(gpu, &qn, qf.data());
+        for (uint32_t i = 0; i < qn; i++) {
+            if ((qf[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) !=
+                (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
+                continue;
+            }
+            VkBool32 present = VK_FALSE;
+            if (vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, m_VkSurface, &present) != VK_SUCCESS || !present) {
+                continue;
+            }
+            m_VkPhys = gpu;
+            m_AppleQueueFamily = i;
+            break;
+        }
+        if (m_VkPhys != VK_NULL_HANDLE) {
+            break;
+        }
+    }
+    if (m_VkPhys == VK_NULL_HANDLE) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: no present-capable Vulkan GPU with a graphics+compute queue family");
+        return false;
+    }
+
+    // Query supported features, then enable the subset libplacebo and PyroWave need.
+    VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan11Features sup11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features sup12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features sup13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceShaderFloat16Int8Features supF16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+    supported.pNext = &sup11;
+    sup11.pNext = &sup12;
+    sup12.pNext = &sup13;
+    sup13.pNext = &supF16;
+    vkGetPhysicalDeviceFeatures2(m_VkPhys, &supported);
+
+    m_AppleDevFeatures = {};
+    m_AppleDevFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    m_AppleDevFeatures.pNext = &m_AppleDevVk11Features;
+    m_AppleDevVk11Features = {};
+    m_AppleDevVk11Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    m_AppleDevVk11Features.pNext = &m_AppleDevVk12Features;
+    m_AppleDevVk12Features = {};
+    m_AppleDevVk12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    m_AppleDevVk12Features.pNext = &m_AppleDevVk13Features;
+    m_AppleDevVk13Features = {};
+    m_AppleDevVk13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    m_AppleDevVk13Features.pNext = &m_AppleDevFloat16Int8Features;
+    m_AppleDevFloat16Int8Features = {};
+    m_AppleDevFloat16Int8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+
+#define ENABLE_IF_SUPPORTED(feat) do { if (supported.features.feat) m_AppleDevFeatures.features.feat = VK_TRUE; } while(0)
+    ENABLE_IF_SUPPORTED(shaderInt16);
+    ENABLE_IF_SUPPORTED(shaderInt64);
+    ENABLE_IF_SUPPORTED(shaderStorageImageExtendedFormats);
+    ENABLE_IF_SUPPORTED(shaderStorageImageWriteWithoutFormat);
+    ENABLE_IF_SUPPORTED(shaderStorageImageReadWithoutFormat);
+    ENABLE_IF_SUPPORTED(fragmentStoresAndAtomics);
+    ENABLE_IF_SUPPORTED(vertexPipelineStoresAndAtomics);
+    ENABLE_IF_SUPPORTED(shaderSampledImageArrayDynamicIndexing);
+    ENABLE_IF_SUPPORTED(shaderUniformBufferArrayDynamicIndexing);
+    ENABLE_IF_SUPPORTED(shaderStorageBufferArrayDynamicIndexing);
+    ENABLE_IF_SUPPORTED(shaderStorageImageArrayDynamicIndexing);
+    ENABLE_IF_SUPPORTED(samplerAnisotropy);
+    ENABLE_IF_SUPPORTED(textureCompressionBC);
+    ENABLE_IF_SUPPORTED(fullDrawIndexUint32);
+    ENABLE_IF_SUPPORTED(independentBlend);
+    ENABLE_IF_SUPPORTED(sampleRateShading);
+    ENABLE_IF_SUPPORTED(multiDrawIndirect);
+    ENABLE_IF_SUPPORTED(robustBufferAccess);
+    ENABLE_IF_SUPPORTED(shaderImageGatherExtended);
+    ENABLE_IF_SUPPORTED(imageCubeArray);
+    ENABLE_IF_SUPPORTED(largePoints);
+#undef ENABLE_IF_SUPPORTED
+
+    if (sup11.storageBuffer16BitAccess) m_AppleDevVk11Features.storageBuffer16BitAccess = VK_TRUE;
+    if (sup11.uniformAndStorageBuffer16BitAccess) m_AppleDevVk11Features.uniformAndStorageBuffer16BitAccess = VK_TRUE;
+    if (sup11.storagePushConstant16) m_AppleDevVk11Features.storagePushConstant16 = VK_TRUE;
+    if (sup11.storageInputOutput16) m_AppleDevVk11Features.storageInputOutput16 = VK_TRUE;
+
+    if (sup12.storageBuffer8BitAccess) m_AppleDevVk12Features.storageBuffer8BitAccess = VK_TRUE;
+    if (sup12.uniformAndStorageBuffer8BitAccess) m_AppleDevVk12Features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
+    if (sup12.storagePushConstant8) m_AppleDevVk12Features.storagePushConstant8 = VK_TRUE;
+    if (sup12.shaderFloat16) m_AppleDevVk12Features.shaderFloat16 = VK_TRUE;
+    if (sup12.shaderInt8) m_AppleDevVk12Features.shaderInt8 = VK_TRUE;
+    if (sup12.shaderSubgroupExtendedTypes) m_AppleDevVk12Features.shaderSubgroupExtendedTypes = VK_TRUE;
+    if (sup12.hostQueryReset) m_AppleDevVk12Features.hostQueryReset = VK_TRUE;         // libplacebo requirement
+    if (sup12.timelineSemaphore) m_AppleDevVk12Features.timelineSemaphore = VK_TRUE;   // libplacebo + sync requirement
+
+    if (sup13.subgroupSizeControl) m_AppleDevVk13Features.subgroupSizeControl = VK_TRUE;  // PyroWave requirement
+    if (sup13.computeFullSubgroups) m_AppleDevVk13Features.computeFullSubgroups = VK_TRUE;
+    if (sup13.synchronization2) m_AppleDevVk13Features.synchronization2 = VK_TRUE;
+
+    if (supF16.shaderFloat16) m_AppleDevFloat16Int8Features.shaderFloat16 = VK_TRUE;
+
+    // Device extensions: swapchain for present, VK_KHR_portability_subset is mandatory on MoltenVK.
+    uint32_t extCount2 = 0;
+    vkEnumerateDeviceExtensionProperties(m_VkPhys, nullptr, &extCount2, nullptr);
+    std::vector<VkExtensionProperties> devExts(extCount2);
+    vkEnumerateDeviceExtensionProperties(m_VkPhys, nullptr, &extCount2, devExts.data());
+    bool hasSwapchain = false, hasPortability = false;
+    for (auto& e : devExts) {
+        hasSwapchain |= strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0;
+        hasPortability |= strcmp(e.extensionName, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME) == 0;
+    }
+    if (!hasSwapchain || !hasPortability) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: device lacks required extensions (swapchain=%d portability=%d)",
+                     (int) hasSwapchain, (int) hasPortability);
+        return false;
+    }
+    m_AppleDeviceExtensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME};
+
+    m_AppleQueueCreateInfo = {};
+    m_AppleQueueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    m_AppleQueueCreateInfo.queueFamilyIndex = m_AppleQueueFamily;
+    m_AppleQueueCreateInfo.queueCount = 1;
+    m_AppleQueueCreateInfo.pQueuePriorities = &m_AppleQueuePriority;
+
+    m_AppleDevCreateInfo = {};
+    m_AppleDevCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    m_AppleDevCreateInfo.pNext = &m_AppleDevFeatures;
+    m_AppleDevCreateInfo.queueCreateInfoCount = 1;
+    m_AppleDevCreateInfo.pQueueCreateInfos = &m_AppleQueueCreateInfo;
+    m_AppleDevCreateInfo.enabledExtensionCount = (uint32_t) m_AppleDeviceExtensions.size();
+    m_AppleDevCreateInfo.ppEnabledExtensionNames = m_AppleDeviceExtensions.data();
+
+    result = vkCreateDevice(m_VkPhys, &m_AppleDevCreateInfo, nullptr, &m_VkDev);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: vkCreateDevice failed (%d)", (int) result);
+        return false;
+    }
+    auto vkGetDeviceQueue = loadAppleVkProc<PFN_vkGetDeviceQueue>(m_AppleGetProcAddr, m_VkInstance, "vkGetDeviceQueue");
+    if (!vkGetDeviceQueue) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: vkGetDeviceQueue not available from MoltenVK");
+        return false;
+    }
+    vkGetDeviceQueue(m_VkDev, m_AppleQueueFamily, 0, &m_VkQueue);
+    m_VkFamily = m_AppleQueueFamily;
+
+    PWL("created MoltenVK device: instance=%p phys=%p device=%p queue=%p family=%u",
+        (void*) m_VkInstance, (void*) m_VkPhys, (void*) m_VkDev, (void*) m_VkQueue, m_VkFamily);
+
+    // Hand the shared instance/device to libplacebo.
+    struct pl_vulkan_import_params ip = {};
+    ip.instance = m_VkInstance;
+    ip.get_proc_addr = m_AppleGetProcAddr;
+    ip.phys_device = m_VkPhys;
+    ip.device = m_VkDev;
+    ip.extensions = m_AppleDeviceExtensions.data();
+    ip.num_extensions = (int) m_AppleDeviceExtensions.size();
+    ip.queue_graphics = {m_AppleQueueFamily, 1, 0};
+    ip.queue_compute = {m_AppleQueueFamily, 1, 0};
+    ip.queue_transfer = {m_AppleQueueFamily, 1, 0};
+    ip.features = &m_AppleDevFeatures;
+    m_Vulkan = pl_vulkan_import(m_Log, &ip);
+    if (!m_Vulkan) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pl_vulkan_import failed");
+        return false;
+    }
+
+    pl_vulkan_swapchain_params sp = {};
+    sp.surface = m_VkSurface;
+    sp.present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    sp.swapchain_depth = 1;
+    m_Swapchain = pl_vulkan_create_swapchain(m_Vulkan, &sp);
+    if (!m_Swapchain) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pl_vulkan_create_swapchain failed");
+        return false;
+    }
+
+    m_Renderer = pl_renderer_create(m_Log, m_Vulkan->gpu);
+    if (!m_Renderer) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pl_renderer_create failed");
+        return false;
+    }
+    return true;
+}
+
+bool PyroWaveVideoDecoder::createApplePyroDevice() {
+    // PyroWave consumes the very same MoltenVK instance/device libplacebo uses, so decode and
+    // present can share GPU memory with no external-memory interop (no dmabufs on macOS).
+    pyrowave_device_create_queue_info qinfo{};
+    qinfo.queue = m_VkQueue;
+    qinfo.familyIndex = m_AppleQueueFamily;
+    qinfo.index = 0;
+
+    pyrowave_device_create_info info{};
+    info.GetInstanceProcAddr = m_AppleGetProcAddr;
+    info.instance = m_VkInstance;
+    info.physical_device = m_VkPhys;
+    info.device = m_VkDev;
+    info.instance_create_info = &m_AppleInstCreateInfo;
+    info.device_create_info = &m_AppleDevCreateInfo;
+    info.queue_info = &qinfo;
+    info.queue_info_count = 1;
+
+    if (pyrowave_create_device(&info, &m_PyroDevice) != PYROWAVE_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: pyrowave_create_device failed");
+        return false;
+    }
+    return true;
+}
+
+bool PyroWaveVideoDecoder::createApplePlanes() {
+    // Plain storable libplacebo textures (no DRM modifiers/external memory on macOS). PyroWave
+    // writes them as storage images; the shared-device timeline semaphore orders decode vs.
+    // present. The initial layout transition to GENERAL happens implicitly via the first
+    // pl_vulkan_hold_ex() (see createSharedTimeline()).
+    int depth = m_TenBit ? 16 : 8;
+    pl_fmt fmt = pl_find_fmt(m_Vulkan->gpu, PL_FMT_UNORM, 1, depth, depth,
+                             (enum pl_fmt_caps) (PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_STORABLE));
+    if (!fmt) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: no sampleable+storable %d-bit plane format (10-bit PyroWave needs R16_UNORM storage images)",
+                     depth);
+        return false;
+    }
+
+    int chromaW = m_YUV444 ? m_Width : m_Width / 2;
+    int chromaH = m_YUV444 ? m_Height : m_Height / 2;
+    int dims[3][2] = {{m_Width, m_Height}, {chromaW, chromaH}, {chromaW, chromaH}};
+    for (int i = 0; i < 3; i++) {
+        Plane& p = m_Planes[i];
+        p.w = dims[i][0];
+        p.h = dims[i][1];
+
+        pl_tex_params tp = {};
+        tp.w = p.w;
+        tp.h = p.h;
+        tp.format = fmt;
+        tp.sampleable = true;
+        tp.storable = true;
+        p.plTex = pl_tex_create(m_Vulkan->gpu, &tp);
+        if (!p.plTex) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: plane %d pl_tex_create failed", i);
+            return false;
+        }
+        p.image = pl_vulkan_unwrap(m_Vulkan->gpu, p.plTex, nullptr, nullptr);
+    }
+    return true;
+}
+#endif  // __APPLE__
+
 bool PyroWaveVideoDecoder::createPyroDevice() {
+#if defined(__APPLE__)
+    if (!createAppleVulkan()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: Apple Vulkan setup failed");
+        return false;
+    }
+    if (!createApplePyroDevice()) {
+        return false;
+    }
+    PWL("createPyroDevice() OK (shared MoltenVK device)");
+    return true;
+#else
     if (pyrowave_create_device_by_compat(0, 0, nullptr, nullptr, nullptr, &m_PyroDevice) != PYROWAVE_SUCCESS) {
         return false;
     }
@@ -175,9 +610,18 @@ bool PyroWaveVideoDecoder::createPyroDevice() {
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = 1;
     return vkAllocateCommandBuffers(m_VkDev, &cai, &m_VkCmd) == VK_SUCCESS;
+#endif
 }
 
 bool PyroWaveVideoDecoder::createPlanes() {
+#if defined(__APPLE__)
+    if (!createApplePlanes()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: createApplePlanes failed");
+        return false;
+    }
+    PWL("createPlanes() OK (libplacebo-owned textures)");
+    return true;
+#else
     VkFormat planeFmt = m_TenBit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
     auto mods = storageModifiers(m_VkPhys, planeFmt);
 
@@ -297,9 +741,16 @@ bool PyroWaveVideoDecoder::createPlanes() {
     vkQueueSubmit(m_VkQueue, 1, &si, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_VkQueue);
     return true;
+#endif
 }
 
 bool PyroWaveVideoDecoder::createLibplacebo(PDECODER_PARAMETERS params) {
+#if defined(__APPLE__)
+    // On macOS the libplacebo instance/device/swapchain were created in createAppleVulkan() so
+    // PyroWave could share the same MoltenVK device (see createPyroDevice()).
+    PWL("createLibplacebo() already done via shared MoltenVK device");
+    return m_Vulkan != nullptr && m_Swapchain != nullptr && m_Renderer != nullptr;
+#else
     pl_log_params logParams = pl_log_default_params;
     logParams.log_cb = [](void*, pl_log_level lvl, const char* msg) {
         if (lvl <= PL_LOG_WARN) SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "[pl] %s", msg);
@@ -368,9 +819,15 @@ bool PyroWaveVideoDecoder::createLibplacebo(PDECODER_PARAMETERS params) {
     bool ret = m_Renderer != nullptr;
     PWL("pl_renderer_create %s", ret ? "OK" : "FAILED");
     return ret;
+#endif
 }
 
 bool PyroWaveVideoDecoder::importPlanes() {
+#if defined(__APPLE__)
+    // Planes are already libplacebo-owned textures on macOS (see createApplePlanes()).
+    PWL("importPlanes() not needed on macOS");
+    return true;
+#else
     int depth = m_TenBit ? 16 : 8;
     pl_fmt fmt = pl_find_fmt(m_Vulkan->gpu, PL_FMT_UNORM, 1, depth, depth, PL_FMT_CAP_SAMPLEABLE);
     if (!fmt) {
@@ -394,9 +851,23 @@ bool PyroWaveVideoDecoder::importPlanes() {
         }
     }
     return true;
+#endif
 }
 
 bool PyroWaveVideoDecoder::createSharedTimeline() {
+#if defined(__APPLE__)
+    // Shared MoltenVK device: the same timeline semaphore is consumed by libplacebo and PyroWave
+    // directly (no external handle export/import exists on macOS).
+    struct pl_vulkan_sem_params sp{};
+    sp.type = VK_SEMAPHORE_TYPE_TIMELINE;
+    sp.initial_value = 0;
+    m_PlSem = pl_vulkan_sem_create(m_Vulkan->gpu, &sp);
+    if (!m_PlSem) {
+        return false;
+    }
+    m_PwSem = m_PlSem;
+    PWL("shared timeline semaphore %p (no external import on macOS)", (void*) m_PlSem);
+#else
     // libplacebo creates an exportable timeline semaphore; PyroWave imports the fd. Both then
     // signal/wait the same timeline for cross-device sync (replaces the full-device vkDeviceWaitIdle).
     union pl_handle handle{};
@@ -419,9 +890,11 @@ bool PyroWaveVideoDecoder::createSharedTimeline() {
         return false;
     }
     m_PwSem = pyrowave_sync_object_get_semaphore(m_SyncObj);
+#endif
 
     // Put the plane textures into external-owned ("held") state so the first decode can write them.
-    // The first decode's acquire waits on the last hold value published here.
+    // The first decode's acquire waits on the last hold value published here. On macOS the hold_ex
+    // also performs the initial layout transition (UNDEFINED -> GENERAL) on the shared device.
     for (auto& p : m_Planes) {
         uint64_t v = ++m_TlNext;
         struct pl_vulkan_hold_params hp{};

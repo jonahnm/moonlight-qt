@@ -18,6 +18,11 @@
 
   #include <SDL.h>
   #include <SDL_vulkan.h>
+  // VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME (mandatory for MoltenVK devices) lives in
+  // vulkan_beta.h, which vulkan.h only pulls in with this define.
+  #ifndef VK_ENABLE_BETA_EXTENSIONS
+    #define VK_ENABLE_BETA_EXTENSIONS 1
+  #endif
   #include <vulkan/vulkan.h>
 
   #include <libplacebo/vulkan.h>
@@ -25,6 +30,7 @@
 
   #include <atomic>
   #include <mutex>
+  #include <vector>
 
 struct pyrowave_device_opaque;
 struct pyrowave_decoder_opaque;
@@ -74,6 +80,17 @@ private:
     bool createLibplacebo(PDECODER_PARAMETERS params);
     bool importPlanes();
     bool createSharedTimeline();  // libplacebo-created timeline sem, imported into PyroWave
+
+#if defined(__APPLE__)
+    // macOS/MoltenVK: the Vulkan instance, window surface and device are created here so that
+    // libplacebo (via pl_vulkan_import) and PyroWave (via pyrowave_create_device) share one
+    // MoltenVK device. No external memory/semaphore interop exists on macOS, so the decode
+    // planes are plain storable libplacebo textures and the timeline semaphore is shared by
+    // direct handle (m_PwSem == m_PlSem).
+    bool createAppleVulkan();    // instance + surface + device + libplacebo import/swapchain/renderer
+    bool createApplePyroDevice();// pyrowave_create_device() sharing the handles above
+    bool createApplePlanes();    // storable/sampleable pl_tex planes
+#endif
 
     bool m_TestOnly;
     int m_Width;
@@ -138,6 +155,26 @@ private:
         bool hasStagingOverlay = false;
         pl_overlay stagingOverlay = {};
     } m_Overlays[Overlay::OverlayMax];
+
+#if defined(__APPLE__)
+    // Lifecycle data for the instance/device Moonlight created for both libplacebo and PyroWave.
+    // The create-info structs must outlive the pyrowave device, so they live as members.
+    VkInstance m_VkInstance;
+    VkApplicationInfo m_AppleAppInfo;
+    VkInstanceCreateInfo m_AppleInstCreateInfo;
+    VkDeviceQueueCreateInfo m_AppleQueueCreateInfo;
+    VkDeviceCreateInfo m_AppleDevCreateInfo;
+    VkPhysicalDeviceFeatures2 m_AppleDevFeatures;
+    VkPhysicalDeviceVulkan11Features m_AppleDevVk11Features;
+    VkPhysicalDeviceVulkan12Features m_AppleDevVk12Features;
+    VkPhysicalDeviceVulkan13Features m_AppleDevVk13Features;
+    VkPhysicalDeviceShaderFloat16Int8Features m_AppleDevFloat16Int8Features;
+    std::vector<const char*> m_AppleInstanceExtensions;
+    std::vector<const char*> m_AppleDeviceExtensions;
+    PFN_vkGetInstanceProcAddr m_AppleGetProcAddr;
+    float m_AppleQueuePriority;
+    uint32_t m_AppleQueueFamily;
+#endif
 };
 
 #endif  // HAVE_PYROWAVE

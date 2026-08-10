@@ -278,14 +278,25 @@ pyrowave {
     SOURCES += streaming/video/pyrowave.cpp
     HEADERS += streaming/video/pyrowave.h
 
-    # drm_fourcc.h for the dmabuf plane-export constants (header-only use; independent of the
-    # drm renderer, which the AppImage build disables via CONFIG+=disable-libdrm).
-    PKGCONFIG += libdrm
+    unix:!macx {
+        # drm_fourcc.h for the dmabuf plane-export constants (header-only use; independent of the
+        # drm renderer, which the AppImage build disables via CONFIG+=disable-libdrm).
+        PKGCONFIG += libdrm
 
-    # Link the PyroWave C API shared library (built via CMake into pyrowave/build) + Vulkan loader.
-    LIBS += -L$$PWD/../pyrowave/build -lpyrowave-shared -lvulkan
-    # Bake the shared-lib location into the runtime search path.
-    QMAKE_RPATHDIR += $$PWD/../pyrowave/build
+        # Link the PyroWave C API shared library (built via CMake into pyrowave/build) + Vulkan loader.
+        LIBS += -L$$PWD/../pyrowave/build -lpyrowave-shared -lvulkan
+        # Bake the shared-lib location into the runtime search path.
+        QMAKE_RPATHDIR += $$PWD/../pyrowave/build
+    }
+    macx {
+        !disable-prebuilts {
+            # MoltenVK (from libs/mac) is the Vulkan ICD; there is no loader on macOS. PyroWave
+            # shares the app's MoltenVK device with libplacebo, so no external-memory interop is
+            # needed (see streaming/video/pyrowave.cpp).
+            LIBS += -L$$PWD/../pyrowave/build -lpyrowave-shared -lMoltenVK
+            QMAKE_RPATHDIR += $$PWD/../pyrowave/build $$PWD/../libs/mac/lib
+        }
+    }
 }
 libva {
     message(VAAPI renderer selected)
