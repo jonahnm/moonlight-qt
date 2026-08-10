@@ -23,6 +23,11 @@
   #ifndef VK_ENABLE_BETA_EXTENSIONS
     #define VK_ENABLE_BETA_EXTENSIONS 1
   #endif
+  // Pulls in vulkan_metal.h (VkMetalSurfaceCreateInfoEXT, VK_EXT_metal_surface) for the
+  // direct Metal surface creation in createAppleSurface().
+  #ifndef VK_USE_PLATFORM_METAL_EXT
+    #define VK_USE_PLATFORM_METAL_EXT 1
+  #endif
   #include <vulkan/vulkan.h>
 
   #include <libplacebo/vulkan.h>
@@ -175,6 +180,7 @@ private:
     PFN_vkGetInstanceProcAddr m_AppleGetProcAddr;
     float m_AppleQueuePriority;
     uint32_t m_AppleQueueFamily;
+    SDL_MetalView m_AppleMetalView;
 #endif
 };
 

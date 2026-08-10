@@ -17,6 +17,10 @@
   #include <drm_fourcc.h>
 #endif
 
+#if defined(__APPLE__)
+  #include <dlfcn.h>
+#endif
+
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -62,6 +66,35 @@ namespace {
   T loadAppleVkProc(PFN_vkGetInstanceProcAddr addr, VkInstance instance, const char* name) {
     return reinterpret_cast<T>(addr(instance, name));
   }
+
+  // The app links libMoltenVK directly (there is no Vulkan loader on macOS). dlopen it directly
+  // rather than via SDL_Vulkan_LoadLibrary(): loading a Vulkan library into SDL would make the
+  // libplacebo/Vulkan (plvk) renderer usable for FFmpeg-decoded codecs, and plvk-on-MoltenVK
+  // stalls (repeated frame loss -> IDR starvation -> connection timeout) with the bundled deps.
+  // Keeping SDL's Vulkan state untouched preserves the VideoToolbox renderer as the default.
+  PFN_vkGetInstanceProcAddr loadAppleVulkanProcAddr() {
+    std::vector<std::string> candidates;
+    if (const char* env = SDL_getenv("GRANITE_VULKAN_LIBRARY")) {
+      candidates.push_back(env);
+    }
+    if (const char* basePath = SDL_GetBasePath()) {
+      candidates.push_back(std::string(basePath) + "../Frameworks/libMoltenVK.dylib");
+      candidates.push_back(std::string(basePath) + "../Frameworks/libvulkan.dylib");
+    }
+    candidates.push_back("@rpath/libMoltenVK.dylib");
+    candidates.push_back("libMoltenVK.dylib");
+    for (auto& candidate : candidates) {
+      void* handle = dlopen(candidate.c_str(), RTLD_LAZY | RTLD_LOCAL);
+      if (handle) {
+        auto addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(handle, "vkGetInstanceProcAddr"));
+        if (addr) {
+          PWL("loaded MoltenVK via \"%s\"", candidate.c_str());
+          return addr;
+        }
+      }
+    }
+    return nullptr;
+  }
 #endif  // __APPLE__
 }  // namespace
 
@@ -82,7 +115,7 @@ PyroWaveVideoDecoder::PyroWaveVideoDecoder(bool testOnly)
       m_AppleQueueCreateInfo{}, m_AppleDevCreateInfo{}, m_AppleDevFeatures{},
       m_AppleDevVk11Features{}, m_AppleDevVk12Features{}, m_AppleDevVk13Features{},
       m_AppleDevFloat16Int8Features{}, m_AppleGetProcAddr(nullptr),
-      m_AppleQueuePriority(1.0f), m_AppleQueueFamily(UINT32_MAX)
+      m_AppleQueuePriority(1.0f), m_AppleQueueFamily(UINT32_MAX), m_AppleMetalView(nullptr)
 #endif
       {}  // NOLINT (empty body is intentional)
 
@@ -133,6 +166,11 @@ PyroWaveVideoDecoder::~PyroWaveVideoDecoder() {
     if (m_VkSurface && m_DestroySurface) {
         PWL("~dtor vkDestroySurface");
         m_DestroySurface(m_VkInstance, m_VkSurface, nullptr);
+    }
+    if (m_AppleMetalView) {
+        PWL("~dtor SDL_Metal_DestroyView");
+        SDL_Metal_DestroyView(m_AppleMetalView);
+        m_AppleMetalView = nullptr;
     }
 #else
     if (m_VkSurface && m_DestroySurface) {
@@ -198,54 +236,21 @@ bool PyroWaveVideoDecoder::createAppleVulkan() {
         return false;
     }
 
-    // Get MoltenVK's vkGetInstanceProcAddr via SDL. Prefer an explicit load so bundled
-    // (Contents/Frameworks) and dev-build (rpath) layouts both work.
-    PWL("apple: SDL_Vulkan_GetVkGetInstanceProcAddr...");
-    m_AppleGetProcAddr = (PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
-    PWL("apple: initial proc addr %p", (void*) m_AppleGetProcAddr);
-    if (!m_AppleGetProcAddr) {
-        const char* basePath = SDL_GetBasePath();
-        std::string candidates[] = {
-            std::string(basePath ? basePath : "") + "../Frameworks/libMoltenVK.dylib",
-            std::string(basePath ? basePath : "") + "../Frameworks/libvulkan.dylib",
-            "@rpath/libMoltenVK.dylib",
-            "libMoltenVK.dylib",
-        };
-        for (auto& candidate : candidates) {
-            PWL("apple: trying SDL_Vulkan_LoadLibrary(\"%s\")", candidate.c_str());
-            if (SDL_Vulkan_LoadLibrary(candidate.c_str())) {
-                m_AppleGetProcAddr = (PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
-                if (m_AppleGetProcAddr) {
-                    PWL("apple: loaded via \"%s\"", candidate.c_str());
-                    break;
-                }
-            }
-        }
-    }
+    // Get MoltenVK's vkGetInstanceProcAddr directly (dlopen), NOT via SDL: loading a Vulkan
+    // library into SDL would enable the plvk renderer for FFmpeg-decoded codecs, which stalls
+    // on MoltenVK with the bundled deps (see loadAppleVulkanProcAddr()).
+    PWL("apple: loading MoltenVK...");
+    m_AppleGetProcAddr = loadAppleVulkanProcAddr();
     if (!m_AppleGetProcAddr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "PyroWave: no Vulkan entry point (is libMoltenVK.dylib loadable?)");
         return false;
     }
 
-    unsigned int extCount = 0;
-    PWL("apple: SDL_Vulkan_GetInstanceExtensions(count)...");
-    if (!SDL_Vulkan_GetInstanceExtensions(m_Window, &extCount, nullptr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_GetInstanceExtensions(count) failed: %s", SDL_GetError());
-        return false;
-    }
-    PWL("apple: count=%u", extCount);
-    std::vector<const char*> sdlExts(extCount);
-    if (!SDL_Vulkan_GetInstanceExtensions(m_Window, &extCount, sdlExts.data())) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_GetInstanceExtensions(list) failed: %s", SDL_GetError());
-        return false;
-    }
-    PWL("apple: extensions fetched");
-
-    // SDL's WSI extensions (VK_KHR_surface + VK_EXT_metal_surface). MoltenVK is loaded directly
-    // (no loader), so VK_KHR_portability_enumeration is neither needed nor supported by it.
-    m_AppleInstanceExtensions.clear();
-    m_AppleInstanceExtensions.insert(m_AppleInstanceExtensions.end(), sdlExts.begin(), sdlExts.end());
+    // Same list SDL_Vulkan_GetInstanceExtensions() returns on macOS (VK_KHR_surface +
+    // VK_EXT_metal_surface); queried statically so SDL's Vulkan state stays untouched.
+    m_AppleInstanceExtensions = {VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_METAL_SURFACE_EXTENSION_NAME};
+    PWL("apple: using %zu instance extensions", m_AppleInstanceExtensions.size());
 
     m_AppleAppInfo = {};
     m_AppleAppInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -477,11 +482,29 @@ bool PyroWaveVideoDecoder::createAppleVulkan() {
 }
 
 bool PyroWaveVideoDecoder::createAppleSurface() {
-    // Real-stream only (never called for testOnly availability probes): the SDL window surface,
+    // Real-stream only (never called for testOnly availability probes): the window surface,
     // libplacebo swapchain and renderer. Kept separate from createAppleVulkan() so the test
     // probes stay headless, like the Linux build (which also skips its present path for probes).
-    if (!SDL_Vulkan_CreateSurface(m_Window, m_VkInstance, &m_VkSurface)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+    //
+    // The Metal surface is created directly (SDL_Metal_CreateView + vkCreateMetalSurfaceEXT,
+    // exactly what SDL_Vulkan_CreateSurface does internally) so MoltenVK stays out of SDL's
+    // Vulkan state.
+    m_AppleMetalView = SDL_Metal_CreateView(m_Window);
+    if (!m_AppleMetalView) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: SDL_Metal_CreateView failed: %s", SDL_GetError());
+        return false;
+    }
+    void* layer = SDL_Metal_GetLayer(m_AppleMetalView);
+    auto vkCreateMetalSurfaceEXT = loadAppleVkProc<PFN_vkCreateMetalSurfaceEXT>(m_AppleGetProcAddr, m_VkInstance, "vkCreateMetalSurfaceEXT");
+    if (!vkCreateMetalSurfaceEXT) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: vkCreateMetalSurfaceEXT not available from MoltenVK");
+        return false;
+    }
+    VkMetalSurfaceCreateInfoEXT surfaceInfo = {VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT};
+    surfaceInfo.pLayer = layer;
+    VkResult result = vkCreateMetalSurfaceEXT(m_VkInstance, &surfaceInfo, nullptr, &m_VkSurface);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "PyroWave: vkCreateMetalSurfaceEXT failed (%d)", (int) result);
         return false;
     }
 
